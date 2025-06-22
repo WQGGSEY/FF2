@@ -7,6 +7,8 @@ import pickle
 import os
 from numba import jit, njit, prange
 from tqdm import tqdm, trange
+import pymc as pm
+import arviz as az
 
 ######################## DATA PREPARATION ########################
 SEED = 42
@@ -49,6 +51,11 @@ with open(f"{file_path}/gov3_bond.pkl", 'rb') as f:
     gov3_df = gov3_df.loc[:, start_date:end_date]
 corp_df = (corp_aa_df + corp_bb_df) / 2
 
+
+#################################################################
+RESULT_PATH = 'JPN_momentum_Failure/results'
+if not os.path.exists(RESULT_PATH):
+    os.makedirs(RESULT_PATH)
 #################################################################
 
 def compute_mom_and_value_return():
@@ -105,6 +112,17 @@ def compute_mom_and_value_return():
     annual_mc_df = pd.concat(annual_mc_df_list, axis=1)
     annual_mc_df.columns = [str(year) for year in range(start_year, end_year + 1)]
 
+    # Annualized Risk-Free Rate Calculation: Average of the risk-free rate over the year
+    annual_rf_df_list = []
+    for year in range(start_year, end_year + 1):
+        temp_rf_df = rf_df[rf_df.columns[rf_df.columns.str.startswith(str(year))]]
+        temp_rf_df = temp_rf_df.mean(axis=1)
+        annual_rf_df_list.append(temp_rf_df)
+    annual_rf_df = pd.concat(annual_rf_df_list, axis=1)
+    annual_rf_df.columns = [str(year) for year in range(start_year, end_year + 1)]
+    annual_rf_df = annual_rf_df.transpose().iloc[:, 0].to_frame(name='Risk-Free Rate')
+
+
     # Value & Momentum Portfolio Construction: Long Top 33%, Short Bottom 33% with dollar neutralization, weighted by market cap
     value_portfolio_df_list = []
     mom_portfolio_df_list = []
@@ -149,15 +167,51 @@ def compute_mom_and_value_return():
     mom_portfolio_df = pd.concat(mom_portfolio_df_list, axis=1)
     mom_portfolio_df.columns = [str(year) for year in range(start_year, end_year + 1)]
     mom_portfolio_df = mom_portfolio_df.fillna(0)
+    # Mixed Portfolio: Value + Momentum, members may not be the same
+    mixed_portfolio_df = value_portfolio_df.add(mom_portfolio_df, fill_value=0)
 
+    # Value and Momentum Returns Calculation
+    value_return_df = (value_portfolio_df * annual_return_df.loc[value_portfolio_df.index]).sum(axis=0)
+    mom_return_df = (mom_portfolio_df * annual_return_df.loc[mom_portfolio_df.index]).sum(axis=0)
+    mixed_portfolio_df = (mixed_portfolio_df * annual_return_df.loc[mixed_portfolio_df.index]).sum(axis=0)
 
+    # Concatenating all returns
+    all_returns_df = pd.concat([value_return_df, mom_return_df, mixed_portfolio_df, annual_rf_df], axis=1)
+    all_returns_df.columns = ['Value Return', 'Momentum Return', '50/50 Portfolio Return', 'Risk-Free Rate']
+    return all_returns_df
 
+def temp():
+    """
+    Temporary function to avoid errors in the code.
+    """
+    pass
 
-
-
-    
 
 
 if __name__ == "__main__":
-    compute_mom_and_value_return()
+    port_return_df = compute_mom_and_value_return()
     print("Value and Momentum Returns Computation Completed.")
+    print("=" * 50)
+    print(port_return_df)
+    print(f"Correlation between Value and Momentum Returns: {port_return_df.corr().iloc[0, 1]:.4f}")
+    print("=" * 50)
+    
+    # plotting the returns
+    plt.figure(figsize=(12, 6))
+    sns.lineplot(data=port_return_df, dashes=False)
+    plt.title('Value and Momentum Returns Over Time')
+    plt.xlabel('Year')
+    plt.ylabel('Annualized Return')
+    plt.legend(title='Portfolio', labels=['Value Return', 'Momentum Return'])
+    plt.grid()
+    plt.tight_layout()
+    plt.savefig(f'{RESULT_PATH}/value_mom_returns.png', dpi=300)
+
+    # bar chart of sharpe ratios=(mean return - risk-free rate) / std deviation of returns
+    sharpe_ratios = (port_return_df.mean() - port_return_df['Risk-Free Rate'].mean()) / port_return_df.std()
+    print(sharpe_ratios)
+    plt.figure(figsize=(8, 5))
+    sns.barplot(x=sharpe_ratios.index, y=sharpe_ratios.values)
+    plt.title('Sharpe Ratios of Value and Momentum Portfolios')
+    plt.xlabel('Portfolio')
+
