@@ -7,11 +7,13 @@ import os
 import pymc as pm
 import pytensor as pt
 import arviz as az
+from tqdm import tqdm
+import xarray as xr
 
 ######################## DATA PREPARATION ########################
 # (기존 코드와 동일)
 file_path='simulation_data'
-start_date = '2016-01-02'
+start_date = '2015-01-02'
 end_date = '2024-12-30'
 start_year = int(start_date.split('-')[0])
 end_year = int(end_date.split('-')[0])
@@ -39,17 +41,17 @@ if not os.path.exists(RESULT_PATH):
 
 ################ HyperParameter For MCMC (수정됨) ################
 SEED = 42
-LOAD = False  # 재실행을 위해 False로 변경 권장
-SAMPLE_SIZE = 4000
-TUNE = 4000
+LOAD = True  # 재실행을 위해 False로 변경 권장
+SAMPLE_SIZE = 2000
+TUNE = 1000
 CHAINS = 4
-TARGET_ACCEPT = 0.98
+TARGET_ACCEPT = 0.99
 
 # 사전분포 스케일 파라미터 (새로 추가/수정)
-BETA_SIGMA_A = 0.5
-BETA_SIGMA_H = 0.5
-BETA_PHI_KAPPA = 0.5
-INITIAL_STATE_SIGMA = 1.0 # 초기 상태 사전 분포 표준편차
+BETA_SIGMA_A = 0.05
+BETA_SIGMA_H = 0.05
+BETA_PHI_KAPPA = 0.05
+INITIAL_STATE_SIGMA = .5 # 초기 상태 사전 분포 표준편차
 #################################################################
 
 # compute_mom_and_value_return() 함수는 기존과 동일
@@ -164,7 +166,6 @@ def compute_mom_and_value_return():
     return all_returns_df
 
 
-# prepare_data_for_mcmc() 함수는 기존과 동일
 def prepare_data_for_mcmc(portfolio_df: pd.DataFrame):
     y = np.array(portfolio_df[['Value Return', 'Momentum Return']].values, dtype=np.float32).transpose() # (2, T)
     T = y.shape[1]
@@ -178,22 +179,14 @@ def prepare_data_for_mcmc(portfolio_df: pd.DataFrame):
         X[t] = np.kron(np.eye(2), x_row)
     return X, y
 
-# =========================================================================================
-# === run_mcmc_sampling 함수: 핵심 수정 사항 포함 ============================================
-# =========================================================================================
+
 def run_mcmc_sampling(X: np.ndarray, y: np.ndarray):
-    """
-    수정된 TVP-VAR 모델을 정의하고 MCMC 샘플링을 실행합니다.
-    1. 분산 파라미터에 대한 사전 분포를 HalfCauchy로 변경
-    2. 초기 상태에 대한 사전 분포를 더 현실적으로 조정
-    3. theta에 대한 계층적 축소(Hierarchical Shrinkage) 사전 분포 적용
-    """
+
     X_pt = pt.tensor.as_tensor_variable(X, name='X')
     y_pt = pt.tensor.as_tensor_variable(y, name='y')
     T = y.shape[1]
     
     with pm.Model() as robust_model:
-        # --- 1. 수정된 Priors: 샘플링 안정성을 위한 변경 ---
         # 분산 파라미터에 HalfCauchy 사용 (0 근처에서 더 안정적)
         sigma_a = pm.HalfCauchy('sigma_a', beta=BETA_SIGMA_A)
         sigma_h = pm.HalfCauchy('sigma_h', beta=BETA_SIGMA_H, shape=2)
@@ -210,13 +203,11 @@ def run_mcmc_sampling(X: np.ndarray, y: np.ndarray):
         # Q의 Cholesky 분해
         Q_sqrt = pt.tensor.diag(pt.tensor.sqrt(theta)) # theta는 분산이므로 sqrt를 취해야 표준편차
 
-        # --- 2. 수정된 Initial States: 더 좁은 사전 분포 사용 ---
         # 초기 상태에 대한 사전 분포의 분산을 줄여 탐색 공간을 제한
         beta_0 = pm.MvNormal('beta_0', mu=pt.tensor.zeros(6), cov=pt.tensor.eye(6) * INITIAL_STATE_SIGMA)
         a_vm0 = pm.Normal('a_vm0', mu=0, sigma=INITIAL_STATE_SIGMA)
         log_h_0 = pm.Normal('log_h_0', mu=0, sigma=INITIAL_STATE_SIGMA, shape=2)
 
-        # --- `for` 루프를 이용한 동적 상태 전개 (기존과 유사) ---
         betas = [beta_0]
         a_vms = [a_vm0]
         log_hs = [log_h_0]
@@ -272,14 +263,9 @@ def run_mcmc_sampling(X: np.ndarray, y: np.ndarray):
     az.to_netcdf(trace, f'{RESULT_PATH}/mcmc_trace_{SEED}_{SAMPLE_SIZE}_{TUNE}_{CHAINS}.nc')
     return trace
 
-# =========================================================================================
-# === analyze_mcmc_trace 함수: PPC Plot 생성 코드 수정 =====================================
-# =========================================================================================
-def analyze_mcmc_trace(trace):
-    """
-    MCMC Trace의 수렴 여부를 정량적/시각적으로 진단하고,
-    주요 결과를 저장합니다.
-    """
+
+def analyze_mcmc_trace(trace, X, y):
+
     print("=" * 60)
     print("MCMC Analysis Summary:")
     print("=" * 60)
@@ -306,7 +292,6 @@ def analyze_mcmc_trace(trace):
     plt.savefig(f'{RESULT_PATH}/mcmc_trace_plot.png', dpi=300)
     plt.close()
 
-    # --- PPC Plot 생성 (수정됨) ---
     print("Saving Posterior Predictive Check (PPC) plot to file...")
     try:
         # pm.sample_posterior_predictive를 통해 생성된 데이터를 사용
@@ -316,12 +301,180 @@ def analyze_mcmc_trace(trace):
         plt.close()
     except Exception as e:
         print(f"Error generating PPC plot: {e}")
+        print("Generating PPC plot manually using existing trace and data...")
+        # 수동으로 PPC 샘플을 생성하는 함수 호출
+        generate_ppc_manually(f'{RESULT_PATH}/mcmc_trace_{SEED}_{SAMPLE_SIZE}_{TUNE}_{CHAINS}.nc', X, y)
+
+def generate_ppc_manually(trace_path: str, X: np.ndarray, y: np.ndarray):
+
+    print(f"Loading existing trace from: {trace_path}")
+    if not os.path.exists(trace_path):
+        print(f"Error: Trace file not found.")
+        return
+    trace = az.from_netcdf(trace_path)
+    
+    print("Extracting posterior samples...")
+    posterior = trace.posterior
+    all_betas = posterior["all_betas"].values
+    all_a_vms = posterior["all_a_vms"].values
+    all_log_hs = posterior["all_log_hs"].values
+    
+    n_chains, n_draws, n_timesteps, _ = all_betas.shape
+    
+    print("Manually generating posterior predictive samples...")
+    ppc_samples = np.zeros((n_chains, n_draws, n_timesteps, y.shape[0]))
+    
+    for chain in tqdm(range(n_chains), desc="Chains"):
+        for draw in range(n_draws):
+            for t in range(n_timesteps):
+                beta_t = all_betas[chain, draw, t, :]
+                a_vm_t = all_a_vms[chain, draw, t]
+                log_h_t = all_log_hs[chain, draw, t, :]
+                x_t = X[t, :, :]
+                
+                mu_t = x_t @ beta_t
+                A_t = np.eye(2)
+                A_t[1, 0] = a_vm_t
+                H_t_diag = np.exp(log_h_t)
+                
+                try:
+                    A_inv_t = np.linalg.inv(A_t)
+                    A_inv_H = A_inv_t * H_t_diag[None, :] 
+                    Omega_t = A_inv_H @ A_inv_t.T
+                    sample = np.random.multivariate_normal(mean=mu_t, cov=Omega_t, size=1)
+                    ppc_samples[chain, draw, t, :] = sample
+                except np.linalg.LinAlgError:
+                    ppc_samples[chain, draw, t, :] = np.nan
+
+    print("Replacing predictive groups in the trace object...")
+    
+    # ArviZ 데이터셋 생성
+    ppc_dataset = xr.Dataset(
+        {"likelihood": (("chain", "draw", "time", "y_dim"), ppc_samples)},
+        coords={"chain": np.arange(n_chains), "draw": np.arange(n_draws), 
+                "time": np.arange(n_timesteps), "y_dim": np.arange(y.shape[0])}
+    )
+    obs_dataset = xr.Dataset(
+        {"likelihood": (("time", "y_dim"), y.T)},
+        coords={"time": np.arange(n_timesteps), "y_dim": np.arange(y.shape[0])}
+    )
+
+    trace.posterior_predictive = ppc_dataset
+    trace.observed_data = obs_dataset
+    
+    print("Generating and saving the corrected PPC plot...")
+    az.plot_ppc(trace, num_pp_samples=100)
+    plt.tight_layout()
+    plt.savefig(f'{RESULT_PATH}/mcmc_ppc_plot_repaired.png', dpi=300)
+    plt.close()
+    print("PPC plot successfully generated and saved as 'mcmc_ppc_plot_repaired.png'.")
+
+def calculate_optimal_portfolio(trace, X, y, annual_returns_df):
+    """
+    MCMC trace를 기반으로 연도별 최적 포트폴리오 가중치와 샤프 비율을 계산합니다.
+
+    Args:
+        trace (az.InferenceData): MCMC 샘플링 결과
+        X (np.ndarray): 설명변수 행렬
+        y (np.ndarray): 실제 수익률 데이터 (2, T)
+        annual_returns_df (pd.DataFrame): 무위험 이자율이 포함된 연간 수익률 데이터프레임
+
+    Returns:
+        pd.DataFrame: 연도별 최적 가중치
+        float: 최적 포트폴리오의 샤프 비율
+    """
+    print("\n" + "="*60)
+    print("Calculating Optimal Portfolio Weights from MCMC Trace...")
+    print("="*60)
+
+    # 1. Trace에서 사후 샘플 추출
+    posterior = trace.posterior
+    all_betas = posterior["all_betas"].values
+    all_a_vms = posterior["all_a_vms"].values
+    all_log_hs = posterior["all_log_hs"].values
+    
+    n_chains, n_draws, n_timesteps, _ = all_betas.shape
+    
+    # 2. 각 샘플/시간별 최적 가중치를 저장할 배열 초기화
+    #    (Value 포트폴리오의 가중치만 저장)
+    optimal_weights_dist = np.zeros((n_chains, n_draws, n_timesteps))
+    
+    # 3. 무위험 이자율 추출
+    risk_free_rates = annual_returns_df['Risk-Free Rate'].values
+
+    # 4. 모든 MCMC 샘플에 대해 최적 가중치 계산
+    for chain in tqdm(range(n_chains), desc="Optimizing Weights (Chains)"):
+        for draw in range(n_draws):
+            for t in range(n_timesteps):
+                # 특정 샘플의 파라미터 값 추출
+                beta_t = all_betas[chain, draw, t, :]
+                a_vm_t = all_a_vms[chain, draw, t]
+                log_h_t = all_log_hs[chain, draw, t, :]
+                x_t = X[t, :, :]
+                
+                # 해당 시점의 예상 수익률(mu)과 공분산(Omega) 재구성
+                mu_t = x_t @ beta_t
+                A_t = np.eye(2)
+                A_t[1, 0] = a_vm_t
+                H_t_diag = np.exp(log_h_t)
+                
+                try:
+                    A_inv_t = np.linalg.inv(A_t)
+                    Omega_t = (A_inv_t * H_t_diag[None, :]) @ A_inv_t.T
+                    
+                    # 샤프 비율 최대화 가중치 계산 (수학적 해)
+                    rf_t = risk_free_rates[t]
+                    inv_Omega_t = np.linalg.inv(Omega_t)
+                    excess_returns = mu_t - rf_t
+                    
+                    # 정규화되지 않은 가중치
+                    unnormalized_weights = inv_Omega_t @ excess_returns
+                    
+                    # 합이 1이 되도록 정규화
+                    total_weight = np.sum(unnormalized_weights)
+                    if total_weight != 0:
+                        normalized_weights = unnormalized_weights / total_weight
+                    else:
+                        normalized_weights = np.array([0.5, 0.5]) # 합이 0일 경우 등분
+
+                    # Value 포트폴리오의 가중치 저장
+                    optimal_weights_dist[chain, draw, t] = normalized_weights[0]
+                    
+                except np.linalg.LinAlgError:
+                    # 행렬 계산 오류 시, 해당 샘플은 NaN으로 처리
+                    optimal_weights_dist[chain, draw, t] = np.nan
+
+    # 5. 각 연도별 최적 가중치의 평균 계산
+    #    NaN 값을 무시하고 평균을 계산합니다.
+    mean_optimal_weights = np.nanmean(optimal_weights_dist, axis=(0, 1))
+    
+    # 6. 결과를 보기 좋은 데이터프레임으로 정리
+    optimal_weights_df = pd.DataFrame({
+        'Year': annual_returns_df.index,
+        'Value_Weight': mean_optimal_weights,
+        'Momentum_Weight': 1 - mean_optimal_weights
+    }).set_index('Year')
+
+    # 7. 계산된 최적 가중치를 사용하여 포트폴리오 수익률 시계열 생성
+    value_returns = y[0, :]
+    momentum_returns = y[1, :]
+    
+    optimal_portfolio_returns = \
+        mean_optimal_weights * value_returns + (1 - mean_optimal_weights) * momentum_returns
+        
+    # 8. 최종 포트폴리오의 샤프 비율 계산
+    optimal_portfolio_excess_returns = optimal_portfolio_returns - risk_free_rates
+    mean_excess_return = np.mean(optimal_portfolio_excess_returns)
+    std_dev_return = np.std(optimal_portfolio_excess_returns)
+    
+    optimal_sharpe_ratio = mean_excess_return / std_dev_return if std_dev_return != 0 else 0
+
+    return optimal_weights_df, optimal_sharpe_ratio
 
 
 if __name__ == "__main__":
     port_return_df = compute_mom_and_value_return()
     print("=" * 60)
-    # 'Corrected' 문구 제거
     print("Annual Portfolio Returns")
     print("=" * 60)
     print(port_return_df)
@@ -354,13 +507,40 @@ if __name__ == "__main__":
 
     # MCMC Analysis
     print("Starting MCMC Analysis...")
+    X, y = prepare_data_for_mcmc(port_return_df)
     if LOAD and os.path.exists(f'{RESULT_PATH}/mcmc_trace_{SEED}_{SAMPLE_SIZE}_{TUNE}_{CHAINS}.nc'):
         print("Loading existing MCMC trace from netCDF file...")
         trace = az.from_netcdf(f'{RESULT_PATH}/mcmc_trace_{SEED}_{SAMPLE_SIZE}_{TUNE}_{CHAINS}.nc')
     else:
         print("netCDF File does not exist. Starting MCMC Sampling...")
-        X, y = prepare_data_for_mcmc(port_return_df)
         trace = run_mcmc_sampling(X, y)
         print("MCMC Analysis Completed. Trace saved to netCDF file.")
     
-    analyze_mcmc_trace(trace)
+    analyze_mcmc_trace(trace, X, y)
+
+    mcmc_years = port_return_df.index[-y.shape[1]:]
+    mcmc_annual_returns_df = port_return_df.loc[mcmc_years]
+    
+    optimal_weights, optimal_sharpe = calculate_optimal_portfolio(trace, X, y, mcmc_annual_returns_df)
+
+    print("\n" + "="*60)
+    print("Annual Optimal Portfolio Weights (Mean of Posterior)")
+    print("="*60)
+    print(optimal_weights.to_string(float_format="%.4f"))
+
+    print("\n" + "="*60)
+    print(f"Ex-Post Sharpe Ratio of Optimal Portfolio: {optimal_sharpe:.4f}")
+    print("="*60)
+
+    # 최적 가중치 시계열 시각화
+    plt.figure(figsize=(12, 6))
+    optimal_weights.plot(kind='bar', stacked=True, ax=plt.gca())
+    plt.title('Optimal Portfolio Weights per Year')
+    plt.ylabel('Weight')
+    plt.xlabel('Year')
+    plt.axhline(0, color='black', linewidth=0.8, linestyle='--')
+    plt.legend(title='Portfolio')
+    plt.tight_layout()
+    plt.savefig(f'{RESULT_PATH}/optimal_weights_plot.png', dpi=300)
+    plt.close()
+    print("\nOptimal weights plot saved to 'optimal_weights_plot.png'")
