@@ -1,23 +1,21 @@
 import numpy as np
-import sys
 import matplotlib.pyplot as plt
 import seaborn as sns
 import pandas as pd
 import pickle
 import os
-from numba import jit, njit, prange
-from tqdm import tqdm, trange
 import pymc as pm
 import pytensor as pt
 import arviz as az
 
 ######################## DATA PREPARATION ########################
-
+# (기존 코드와 동일)
 file_path='simulation_data'
 start_date = '2016-01-02'
 end_date = '2024-12-30'
 start_year = int(start_date.split('-')[0])
 end_year = int(end_date.split('-')[0])
+# ... (데이터 로딩 부분은 기존과 동일)
 with open(f"{file_path}/KS200_MASK.pkl", 'rb') as f:
     mask_df:pd.DataFrame = pickle.load(f).ffill(axis=1)
     mask_df = mask_df.loc[:, start_date:end_date]
@@ -30,55 +28,31 @@ with open(f"{file_path}/MarketCap.pkl", 'rb') as f:
 with open(f"{file_path}/ifrs-full_Equity.pkl", 'rb') as f:
     be_df:pd.DataFrame = pickle.load(f).ffill(axis=1)
     be_df = be_df.loc[:, start_date:end_date]
-with open(f"{file_path}/KOSPI_Close.pkl", 'rb') as f:
-    kospi_close_df:pd.DataFrame = pickle.load(f).ffill(axis=1)
-    kospi_return_df = kospi_close_df.pct_change(axis=1)
-    mkt_df = kospi_return_df.loc[:, start_date:end_date]
 with open(f"{file_path}/rf_bond.pkl", 'rb') as f:
     rf_df:pd.DataFrame = pickle.load(f).ffill(axis=1) * 0.01
     rf_df = rf_df.loc[:, start_date:end_date]
-with open(f"{file_path}/corp_aa_bond.pkl", 'rb') as f:
-    corp_aa_df:pd.DataFrame = pickle.load(f).ffill(axis=1) * 0.01
-    corp_aa_df = corp_aa_df.loc[:, start_date:end_date]
-with open(f"{file_path}/corp_bb_bond.pkl", 'rb') as f:
-    corp_bb_df:pd.DataFrame = pickle.load(f).ffill(axis=1) * 0.01
-    corp_bb_df = corp_bb_df.loc[:, start_date:end_date]
-with open(f"{file_path}/gov10_bond.pkl", 'rb') as f:
-    gov10_df:pd.DataFrame = pickle.load(f).ffill(axis=1) * 0.01
-    gov10_df = gov10_df.loc[:, start_date:end_date]
-with open(f"{file_path}/gov3_bond.pkl", 'rb') as f:
-    gov3_df:pd.DataFrame = pickle.load(f).ffill(axis=1) * 0.01
-    gov3_df = gov3_df.loc[:, start_date:end_date]
-corp_df = (corp_aa_df + corp_bb_df) / 2
-
-
 #################################################################
 RESULT_PATH = 'JPN_momentum_Failure/results'
 if not os.path.exists(RESULT_PATH):
     os.makedirs(RESULT_PATH)
 #################################################################
 
-
-################ HyperParameter For MCMC ########################
+################ HyperParameter For MCMC (수정됨) ################
 SEED = 42
-LOAD = True
-SAMPLE_SIZE = 2000
-TUNE = 1000
-chains = 4
-target_accept = 0.95
+LOAD = False  # 재실행을 위해 False로 변경 권장
+SAMPLE_SIZE = 4000
+TUNE = 4000
+CHAINS = 4
+TARGET_ACCEPT = 0.98
 
-d_a0 = 0.01
-d_a1 = 0.01
-d_h0 = 0.01
-d_h1 = 0.01
-d = 0.01
-c_0 = 0.01
-c_1 = 0.01
-T = end_year - start_year + 1  # Total number of years in the dataset
+# 사전분포 스케일 파라미터 (새로 추가/수정)
+BETA_SIGMA_A = 0.5
+BETA_SIGMA_H = 0.5
+BETA_PHI_KAPPA = 0.5
+INITIAL_STATE_SIGMA = 1.0 # 초기 상태 사전 분포 표준편차
 #################################################################
 
-
-
+# compute_mom_and_value_return() 함수는 기존과 동일
 def compute_mom_and_value_return():
     """
     가치(B/M) 및 모멘텀 신호를 기반으로 연간 리밸런싱 포트폴리오를 구성하고,
@@ -189,10 +163,10 @@ def compute_mom_and_value_return():
     
     return all_returns_df
 
+
+# prepare_data_for_mcmc() 함수는 기존과 동일
 def prepare_data_for_mcmc(portfolio_df: pd.DataFrame):
     y = np.array(portfolio_df[['Value Return', 'Momentum Return']].values, dtype=np.float32).transpose() # (2, T)
-    # X[:, t] = I_2 kronecker product [1, y[0, t-1], y[1, t-1]],
-    # Construct X such that for each t, X[t] = I_2 ⊗ [1, y[0, t-1], y[1, t-1]]
     T = y.shape[1]
     X = np.zeros((T, 2, 6), dtype=np.float32) # (T, 2, 6)
     for t in range(T):
@@ -204,77 +178,156 @@ def prepare_data_for_mcmc(portfolio_df: pd.DataFrame):
         X[t] = np.kron(np.eye(2), x_row)
     return X, y
 
+# =========================================================================================
+# === run_mcmc_sampling 함수: 핵심 수정 사항 포함 ============================================
+# =========================================================================================
 def run_mcmc_sampling(X: np.ndarray, y: np.ndarray):
-    X = pt.tensor.as_tensor_variable(X)
-    y = pt.tensor.as_tensor_variable(y)
-    with pm.Model() as model:
-        sigma_a_sq = pm.InverseGamma('sigma_a_sq', alpha=d_a0, beta=d_a1)
-        sigma_h_sq = pm.InverseGamma('sigma_h_sq', alpha=d_h0, beta=d_h1)
-        phi = pm.Gamma('phi', alpha=d, beta=d, shape=6)
-        kappa_sq = pm.Gamma('kappa_sq', alpha=c_0, beta=c_1)
-        theta = pm.InverseGamma('theta', alpha=0.5, beta=1/(2*phi * kappa_sq), shape=6)
-        Q = pm.Deterministic('Q', pt.tensor.diag(theta))
-        beta_0 = pm.MvNormal('beta_0', mu=pt.tensor.zeros(shape=6), cov=pt.tensor.eye(6) * 10)
-        a_vm0 = pm.Normal('a_vm0', mu=0, sigma=10)
-        log_h_0 = pm.Normal('log_h_0', mu=0, sigma=10, shape=2)
+    """
+    수정된 TVP-VAR 모델을 정의하고 MCMC 샘플링을 실행합니다.
+    1. 분산 파라미터에 대한 사전 분포를 HalfCauchy로 변경
+    2. 초기 상태에 대한 사전 분포를 더 현실적으로 조정
+    3. theta에 대한 계층적 축소(Hierarchical Shrinkage) 사전 분포 적용
+    """
+    X_pt = pt.tensor.as_tensor_variable(X, name='X')
+    y_pt = pt.tensor.as_tensor_variable(y, name='y')
+    T = y.shape[1]
+    
+    with pm.Model() as robust_model:
+        # --- 1. 수정된 Priors: 샘플링 안정성을 위한 변경 ---
+        # 분산 파라미터에 HalfCauchy 사용 (0 근처에서 더 안정적)
+        sigma_a = pm.HalfCauchy('sigma_a', beta=BETA_SIGMA_A)
+        sigma_h = pm.HalfCauchy('sigma_h', beta=BETA_SIGMA_H, shape=2)
 
-        # Random Walks
+        # theta에 대한 계층적 축소(Hierarchical Shrinkage) 적용
+        # theta_i가 독립적이라고 가정하는 대신, 공통 분포에서 왔다고 가정
+        phi = pm.HalfNormal('phi', sigma=BETA_PHI_KAPPA) # Global shrinkage parameter
+        kappa_sq = pm.HalfNormal('kappa_sq', sigma=BETA_PHI_KAPPA) # Global shrinkage parameter
+        
+        # theta의 각 원소는 공통 분포를 따름 (Local shrinkage)
+        theta_raw = pm.HalfNormal('theta_raw', sigma=1.0, shape=6)
+        theta = pm.Deterministic('theta', theta_raw * pt.tensor.sqrt(1 / (2 * phi * kappa_sq)))
+        
+        # Q의 Cholesky 분해
+        Q_sqrt = pt.tensor.diag(pt.tensor.sqrt(theta)) # theta는 분산이므로 sqrt를 취해야 표준편차
+
+        # --- 2. 수정된 Initial States: 더 좁은 사전 분포 사용 ---
+        # 초기 상태에 대한 사전 분포의 분산을 줄여 탐색 공간을 제한
+        beta_0 = pm.MvNormal('beta_0', mu=pt.tensor.zeros(6), cov=pt.tensor.eye(6) * INITIAL_STATE_SIGMA)
+        a_vm0 = pm.Normal('a_vm0', mu=0, sigma=INITIAL_STATE_SIGMA)
+        log_h_0 = pm.Normal('log_h_0', mu=0, sigma=INITIAL_STATE_SIGMA, shape=2)
+
+        # --- `for` 루프를 이용한 동적 상태 전개 (기존과 유사) ---
         betas = [beta_0]
         a_vms = [a_vm0]
         log_hs = [log_h_0]
+        
+        for t in range(T):
+            beta_tm1 = betas[t]
+            a_vm_tm1 = a_vms[t]
+            log_h_tm1 = log_hs[t]
+            
+            # 비중심화된 방식의 혁신(innovation) 샘플링
+            beta_offset = pm.MvNormal(f'beta_offset_{t+1}', mu=pt.tensor.zeros(6), cov=pt.tensor.eye(6))
+            a_vm_offset = pm.Normal(f'a_vm_offset_{t+1}', mu=0, sigma=1)
+            log_h_offset = pm.Normal(f'log_h_offset_{t+1}', mu=0, sigma=1, shape=2)
 
-        # State Transition Equation
-        for t in range(1, T):
-            beta_tm1 = betas[t-1]
-            a_vm_tm1 = a_vms[t-1]
-            log_h_tm1 = log_hs[t-1]
-            beta_t = pm.MvNormal(f'beta_{t}', mu=beta_tm1, cov=Q, shape=6)
-            a_vm_t = pm.Normal(f'a_vm_{t}', mu=a_vm_tm1, sigma=pt.tensor.sqrt(sigma_a_sq))
-            log_h_t = pm.Normal(f'log_h_{t}', mu=log_h_tm1, sigma=pt.tensor.sqrt(sigma_h_sq), shape=2)
+            # 결정론적으로 다음 상태 계산
+            beta_t = beta_tm1 + Q_sqrt @ beta_offset
+            a_vm_t = a_vm_tm1 + sigma_a * a_vm_offset
+            log_h_t = log_h_tm1 + sigma_h * log_h_offset
 
+            # Likelihood 계산
             A_t = pt.tensor.set_subtensor(pt.tensor.eye(2)[1, 0], a_vm_t)
-            H_t = pt.tensor.diag(pt.tensor.exp(log_h_t))
+            H_t_diag = pt.tensor.exp(log_h_t)
+            
+            # Likelihood의 공분산 행렬 계산
             A_inv_t = pt.tensor.linalg.inv(A_t)
-            Omega_t = A_inv_t @ H_t @ A_inv_t.T # shape (2, 2)
+            A_inv_H = A_inv_t * H_t_diag[None, :] 
+            Omega_t = A_inv_H @ A_inv_t.T
 
-            pm.MvNormal(f'likelihood_{t}', mu=X[t] @ beta_t, cov=Omega_t, observed=y[:, t])
+            pm.MvNormal(f'likelihood_{t}', mu=X_pt[t] @ beta_t, cov=Omega_t, observed=y_pt[:, t])
+            
             betas.append(beta_t)
             a_vms.append(a_vm_t)
             log_hs.append(log_h_t)
 
-    with model:
-        trace = pm.sample(draws=SAMPLE_SIZE, tune=TUNE, chains=chains, target_accept=target_accept, return_inferencedata=True, random_seed=SEED, progressbar=True)
+        all_betas = pm.Deterministic('all_betas', pt.tensor.stack(betas[1:]))
+        all_log_hs = pm.Deterministic('all_log_hs', pt.tensor.stack(log_hs[1:]))
+        all_a_vms = pm.Deterministic('all_a_vms', pt.tensor.stack(a_vms[1:]))
+
+        # --- 샘플링 (수정된 하이퍼파라미터 적용) ---
+        trace = pm.sample(
+            draws=SAMPLE_SIZE, 
+            tune=TUNE, 
+            chains=CHAINS, 
+            target_accept=TARGET_ACCEPT, 
+            random_seed=SEED,
+            progressbar=True
+        )
     
-    az.to_netcdf(trace, f'{RESULT_PATH}/mcmc_trace.nc')
+    # --- 사후 예측 샘플링 (PPC Plot을 위해 추가) ---
+    with robust_model:
+        pm.sample_posterior_predictive(trace, extend_inferencedata=True)
+
+    az.to_netcdf(trace, f'{RESULT_PATH}/mcmc_trace_{SEED}_{SAMPLE_SIZE}_{TUNE}_{CHAINS}.nc')
     return trace
 
+# =========================================================================================
+# === analyze_mcmc_trace 함수: PPC Plot 생성 코드 수정 =====================================
+# =========================================================================================
 def analyze_mcmc_trace(trace):
     """
-    MCMC Trace 분석 함수
+    MCMC Trace의 수렴 여부를 정량적/시각적으로 진단하고,
+    주요 결과를 저장합니다.
     """
-    print("MCMC Trace Analysis:")
-    print(az.summary(trace, round_to=2))
+    print("=" * 60)
+    print("MCMC Analysis Summary:")
+    print("=" * 60)
+    summary = az.summary(trace)
+    print(summary)
     
-    # Plotting the trace
-    az.plot_trace(trace)
+    if (summary['r_hat'] > 1.01).any():
+        print("\n[Warning] Some parameters have R-hat values exceeding 1.01. There may be convergence issues.")
+        print(summary[summary['r_hat'] > 1.01])
+    else:
+        print("\n[Success] All parameters have R-hat values below 1.01, indicating good convergence.")
+
+    min_ess = CHAINS * 100
+    if (summary['ess_bulk'] < min_ess).any() or (summary['ess_tail'] < min_ess).any():
+        print(f"\n[Warning] Some parameters have effective sample sizes (ESS) below {min_ess}.")
+        print(summary[(summary['ess_bulk'] < min_ess) | (summary['ess_tail'] < min_ess)])
+    else:
+        print(f"\n[Success] All parameters have effective sample sizes (ESS) above {min_ess}.")
+
+    print("Saving Trace Plot to file...")
+    # 진단이 필요한 핵심 파라미터 위주로 trace plot 확인
+    az.plot_trace(trace, var_names=['sigma_a', 'sigma_h', 'phi', 'kappa_sq', 'beta_0', 'a_vm0'])
     plt.tight_layout()
     plt.savefig(f'{RESULT_PATH}/mcmc_trace_plot.png', dpi=300)
-    
-    # Posterior predictive checks
-    az.plot_ppc(trace)
-    plt.tight_layout()
-    plt.savefig(f'{RESULT_PATH}/mcmc_ppc_plot.png', dpi=300)
+    plt.close()
+
+    # --- PPC Plot 생성 (수정됨) ---
+    print("Saving Posterior Predictive Check (PPC) plot to file...")
+    try:
+        # pm.sample_posterior_predictive를 통해 생성된 데이터를 사용
+        az.plot_ppc(trace, num_pp_samples=100, group="posterior_predictive")
+        plt.tight_layout()
+        plt.savefig(f'{RESULT_PATH}/mcmc_ppc_plot.png', dpi=300)
+        plt.close()
+    except Exception as e:
+        print(f"Error generating PPC plot: {e}")
+
 
 if __name__ == "__main__":
     port_return_df = compute_mom_and_value_return()
     print("=" * 60)
-    print("Corrected Annual Portfolio Returns")
+    # 'Corrected' 문구 제거
+    print("Annual Portfolio Returns")
     print("=" * 60)
     print(port_return_df)
     print(f"\nCorrelation between Value and Momentum Returns: {port_return_df.corr().iloc[0, 1]:.4f}")
     print("=" * 60)
     
-    # 누적 수익률 그래프
     cumulative_returns = (1 + port_return_df[['Value Return', 'Momentum Return', '50/50 Portfolio Return']]).cumprod()
     plt.figure(figsize=(12, 6))
     sns.lineplot(data=cumulative_returns-1, dashes=False, marker='o')
@@ -285,7 +338,6 @@ if __name__ == "__main__":
     plt.tight_layout()
     plt.savefig(f'{RESULT_PATH}/value_mom_cumulative_returns.png', dpi=300)
 
-    # 샤프 비율 바 차트
     sharpe_ratios = (port_return_df[['Value Return', 'Momentum Return', '50/50 Portfolio Return']].mean() - port_return_df['Risk-Free Rate'].mean()) / port_return_df[['Value Return', 'Momentum Return', '50/50 Portfolio Return']].std()
     print(f"Sharpe Ratios:\n{sharpe_ratios}")
     print("=" * 60)
@@ -301,16 +353,14 @@ if __name__ == "__main__":
     plt.savefig(f'{RESULT_PATH}/value_mom_sharpe_ratios.png', dpi=300)
 
     # MCMC Analysis
-    print("=" * 60)
     print("Starting MCMC Analysis...")
-    if LOAD and os.path.exists(f'{RESULT_PATH}/mcmc_trace.nc'):
+    if LOAD and os.path.exists(f'{RESULT_PATH}/mcmc_trace_{SEED}_{SAMPLE_SIZE}_{TUNE}_{CHAINS}.nc'):
         print("Loading existing MCMC trace from netCDF file...")
-        trace = az.from_netcdf(f'{RESULT_PATH}/mcmc_trace.nc')
+        trace = az.from_netcdf(f'{RESULT_PATH}/mcmc_trace_{SEED}_{SAMPLE_SIZE}_{TUNE}_{CHAINS}.nc')
     else:
         print("netCDF File does not exist. Starting MCMC Sampling...")
         X, y = prepare_data_for_mcmc(port_return_df)
         trace = run_mcmc_sampling(X, y)
         print("MCMC Analysis Completed. Trace saved to netCDF file.")
+    
     analyze_mcmc_trace(trace)
-
-
